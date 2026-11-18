@@ -168,6 +168,18 @@ function handleFetch(repo: RepoRec, packets: readonly Pkt[], rest: Buffer, versi
   }
   const args = parseFetchArgs(lines);
   const haves = [...args.haves, ...args.deepenNot];
+  const cacheKey = [
+    version2 ? 'v2' : 'v0',
+    args.wants.join(' '),
+    haves.join(' '),
+    args.shallow.join(' '),
+    args.depth === null ? '' : String(args.depth),
+  ].join('|');
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
   const selection = selectFetchObjects(repo.objects, args.wants, haves, args.shallow, args.depth);
   const pack = writePack(selection.objects);
   const commonHave = args.haves.find((have) => repo.objects.has(have));
@@ -192,7 +204,10 @@ function handleFetch(repo: RepoRec, packets: readonly Pkt[], rest: Buffer, versi
     parts.push(...sidebandPackets(pack));
     parts.push(PKT_FLUSH);
   }
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const bodyOut = Buffer.concat(parts);
+  if (repo.fetchCache.size >= 256) repo.fetchCache.clear();
+  repo.fetchCache.set(cacheKey, bodyOut);
+  sendBuffer(res, 200, 'application/x-git-upload-pack-result', bodyOut);
 }
 
 function handleReceivePack(repo: RepoRec, body: Buffer, res: ServerResponse): void {

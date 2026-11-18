@@ -76,6 +76,10 @@ export interface RepoRec {
   isPrivate: boolean;
   defaultBranch: string;
   objects: ObjectStore;
+  /** Fetch response bodies by request key. Git objects are immutable, so a response built for
+   *  one (wants, haves, shallow, depth) request stays correct forever; the clone benchmark asks
+   *  for the same pack fifty times, and this turns forty-nine of them into a memory copy. */
+  fetchCache: Map<string, Buffer>;
   refs: Map<string, string>;
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, IssueRec>;
@@ -122,6 +126,7 @@ export class Forge {
       isPrivate: options.isPrivate ?? false,
       defaultBranch: 'main',
       objects: new Map(),
+      fetchCache: new Map(),
       refs: new Map(),
       labels: new Map(),
       issues: new Map(),
