@@ -287,8 +287,9 @@ export function selectFetchObjects(
       }
     };
     for (const want of wants) enqueue(want, 1);
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    // An index pointer, not shift(): the queue is walked once, front to back.
+    for (let head = 0; head < queue.length; head += 1) {
+      const oid = queue[head] as string;
       const gen = generations.get(oid) as number;
       if (gen >= depth) continue;
       const object = store.get(oid);
@@ -403,11 +404,16 @@ export function writePack(objects: readonly GitObj[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(packEntryHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    // Speed over size: the wire here is a loopback hop and the reader inflates any level,
+    // so the fastest deflate is the right trade for a timed fetch.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  // The trailer hashes the body part by part (no full-body copy just to hash it), then a
+  // single concat assembles body + trailer.
+  const hash = createHash('sha1');
+  for (const part of parts) hash.update(part);
+  parts.push(hash.digest());
+  return Buffer.concat(parts);
 }
 
 interface PackEntry {
@@ -517,25 +523,50 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
 
 export type Pkt = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' } | { kind: 'end' };
 
+const HEX_DIGIT_BYTES: readonly number[] = [...'0123456789abcdef'].map((ch) => ch.charCodeAt(0));
+
 /** One pkt-line: a 4-hex-digit length (counting itself) and the payload. */
 export function encodePkt(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = body.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, body]);
+  if (length > 0xffff) {
+    const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
+    return Buffer.concat([header, body]);
+  }
+  // One allocation and one copy: the header digits are written straight into the output.
+  const out = Buffer.allocUnsafe(length);
+  out[0] = HEX_DIGIT_BYTES[(length >> 12) & 0xf] as number;
+  out[1] = HEX_DIGIT_BYTES[(length >> 8) & 0xf] as number;
+  out[2] = HEX_DIGIT_BYTES[(length >> 4) & 0xf] as number;
+  out[3] = HEX_DIGIT_BYTES[length & 0xf] as number;
+  body.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
 export const PKT_DELIM = Buffer.from('0001', 'ascii');
+
+/** One hex digit's value from its byte, or -1 when the byte is not a hex digit. */
+function hexNibble(byte: number): number {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+  if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+  if (byte >= 0x41 && byte <= 0x46) return byte - 0x41 + 10;
+  return -1;
+}
 
 /** Split a buffer into pkt-lines; returns the packets and the bytes after the first flush. */
 export function parsePkts(buffer: Buffer): { packets: Pkt[]; rest: Buffer } {
   const packets: Pkt[] = [];
   let offset = 0;
   while (offset + 4 <= buffer.length) {
-    const hex = buffer.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) break;
-    const length = parseInt(hex, 16);
+    // The 4-byte length prefix parsed by hand: a regex test and a substring per packet
+    // were pure overhead on a path every git exchange walks.
+    const n0 = hexNibble(buffer[offset] as number);
+    const n1 = hexNibble(buffer[offset + 1] as number);
+    const n2 = hexNibble(buffer[offset + 2] as number);
+    const n3 = hexNibble(buffer[offset + 3] as number);
+    if (n0 < 0 || n1 < 0 || n2 < 0 || n3 < 0) break;
+    const length = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -562,7 +593,10 @@ export function parsePkts(buffer: Buffer): { packets: Pkt[]; rest: Buffer } {
 export function pktTextLines(packets: readonly Pkt[]): string[] {
   const lines: string[] = [];
   for (const packet of packets) {
-    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
+    if (packet.kind !== 'data') continue;
+    const payload = packet.payload;
+    const end = payload.length > 0 && payload[payload.length - 1] === 0x0a ? payload.length - 1 : payload.length;
+    lines.push(payload.toString('utf8', 0, end));
   }
   return lines;
 }

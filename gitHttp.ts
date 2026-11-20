@@ -20,7 +20,7 @@ import {
   parseTag,
   type Pkt,
 } from './git.ts';
-import { ForgeError, type Forge, type RepoRec } from './forge.ts';
+import { ForgeError, touchRefs, type Forge, type RepoRec } from './forge.ts';
 import { authorized, readBody, sendError } from './http.ts';
 
 const AGENT = 'ghforge/1.0';
@@ -57,6 +57,11 @@ function peeledOf(repo: RepoRec, oid: string): string | null {
 }
 
 function v0Advertisement(repo: RepoRec, service: string): Buffer {
+  // The answer depends only on the ref table and the default branch; touchRefs clears
+  // this cache on every ref change, and the default branch is part of the key.
+  const cacheKey = `${service}|${repo.defaultBranch}`;
+  const cached = repo.advCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const isUpload = service === 'git-upload-pack';
   const caps = isUpload
     ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`
@@ -79,12 +84,16 @@ function v0Advertisement(repo: RepoRec, service: string): Buffer {
     parts.push(encodePkt(index === 0 ? `${line}\0${caps}\n` : `${line}\n`));
   });
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  repo.advCache.set(cacheKey, body);
+  return body;
 }
 
-function v2Advertisement(service: string): Buffer {
-  const parts: Buffer[] = [
-    encodePkt(`# service=${service}\n`),
+/** The v2 capability advertisement names no repository state, so both services' answers
+ *  are built once at startup and served verbatim forever. */
+const V2_ADVERTISEMENTS: Readonly<Record<string, Buffer>> = Object.freeze({
+  'git-upload-pack': Buffer.concat([
+    encodePkt('# service=git-upload-pack\n'),
     PKT_FLUSH,
     encodePkt('version 2\n'),
     encodePkt(`agent=${AGENT}\n`),
@@ -92,8 +101,21 @@ function v2Advertisement(service: string): Buffer {
     encodePkt('fetch=shallow\n'),
     encodePkt('object-format=sha1\n'),
     PKT_FLUSH,
-  ];
-  return Buffer.concat(parts);
+  ]),
+  'git-receive-pack': Buffer.concat([
+    encodePkt('# service=git-receive-pack\n'),
+    PKT_FLUSH,
+    encodePkt('version 2\n'),
+    encodePkt(`agent=${AGENT}\n`),
+    encodePkt('ls-refs=unborn\n'),
+    encodePkt('fetch=shallow\n'),
+    encodePkt('object-format=sha1\n'),
+    PKT_FLUSH,
+  ]),
+});
+
+function v2Advertisement(service: string): Buffer {
+  return V2_ADVERTISEMENTS[service] as Buffer;
 }
 
 function handleLsRefs(repo: RepoRec, packets: readonly Pkt[], res: ServerResponse): void {
@@ -108,11 +130,20 @@ function handleLsRefs(repo: RepoRec, packets: readonly Pkt[], res: ServerRespons
       continue;
     }
     if (!pastDelim || packet.kind !== 'data') continue;
-    const line = packet.payload.toString('utf8').replace(/\n$/, '');
+    const rawLine = packet.payload.toString('utf8');
+    const line = rawLine.endsWith('\n') ? rawLine.slice(0, -1) : rawLine;
     if (line === 'peel') peel = true;
     else if (line === 'symrefs') symrefs = true;
     else if (line === 'unborn') unborn = true;
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
+  }
+  // The answer depends only on the ref table, the default branch and these arguments;
+  // touchRefs clears this cache on every ref change.
+  const cacheKey = `${peel}|${symrefs}|${unborn}|${repo.defaultBranch}|${prefixes.join(' ')}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const lines: string[] = [];
@@ -136,7 +167,9 @@ function handleLsRefs(repo: RepoRec, packets: readonly Pkt[], res: ServerRespons
   }
   const parts = lines.map((line) => encodePkt(`${line}\n`));
   parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  repo.lsRefsCache.set(cacheKey, body);
+  sendBuffer(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 interface FetchArgs {
@@ -273,6 +306,7 @@ function applyRefUpdate(repo: RepoRec, command: { oldOid: string; newOid: string
     if (current === ZERO_OID) return `ng ${ref} reference does not exist`;
     if (current !== oldOid) return `ng ${ref} reference is not up to date`;
     repo.refs.delete(ref);
+    touchRefs(repo);
     return `ok ${ref}`;
   }
   const object = repo.objects.get(newOid);
@@ -281,6 +315,7 @@ function applyRefUpdate(repo: RepoRec, command: { oldOid: string; newOid: string
   if (current === ZERO_OID) {
     if (oldOid !== ZERO_OID) return `ng ${ref} reference is not up to date`;
     repo.refs.set(ref, newOid);
+    touchRefs(repo);
     return `ok ${ref}`;
   }
   if (current !== oldOid) return `ng ${ref} reference is not up to date`;
@@ -289,6 +324,7 @@ function applyRefUpdate(repo: RepoRec, command: { oldOid: string; newOid: string
     if (!isAncestor(repo.objects, current, newOid)) return `ng ${ref} non-fast-forward`;
   }
   repo.refs.set(ref, newOid);
+  touchRefs(repo);
   return `ok ${ref}`;
 }
 

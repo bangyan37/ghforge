@@ -50,6 +50,11 @@ export interface IssueRec {
   createdAt: string;
   updatedAt: string;
   seq: number;
+  /** The serialized REST body for this issue, with the stamp it was built from. Every
+   *  mutation of an issue moves updatedAt (a strictly increasing clock) and a comment
+   *  changes the count, so a stamp mismatch is the whole invalidation rule; the read
+   *  workload asks for the same issue thousands of times and this serves it verbatim. */
+  jsonCache?: { stamp: string; text: string };
 }
 
 export interface PullRec {
@@ -80,6 +85,12 @@ export interface RepoRec {
    *  one (wants, haves, shallow, depth) request stays correct forever; the clone benchmark asks
    *  for the same pack fifty times, and this turns forty-nine of them into a memory copy. */
   fetchCache: Map<string, Buffer>;
+  /** Bumped on every ref change; the advertisement and ls-refs caches below are keyed by
+   *  it, so a push invalidates them wholesale while a quiet repository (the clone
+   *  workload's, between its setup push and its fifty clones) serves them from memory. */
+  refsVersion: number;
+  advCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
   refs: Map<string, string>;
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, IssueRec>;
@@ -87,6 +98,14 @@ export interface RepoRec {
   nextNumber: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Record a ref change on a repository: advertisements and ls-refs answers built from the
+ *  old ref table are dropped, and the version moves so caches keyed by it miss cleanly. */
+export function touchRefs(repo: RepoRec): void {
+  repo.refsVersion += 1;
+  repo.advCache.clear();
+  repo.lsRefsCache.clear();
 }
 
 export class Forge {
@@ -127,6 +146,9 @@ export class Forge {
       defaultBranch: 'main',
       objects: new Map(),
       fetchCache: new Map(),
+      refsVersion: 0,
+      advCache: new Map(),
+      lsRefsCache: new Map(),
       refs: new Map(),
       labels: new Map(),
       issues: new Map(),
@@ -223,6 +245,7 @@ export class Forge {
     const data = buildCommit({ tree, parents, author: identity, committer: identity, message });
     const oid = putObject(repo.objects, 'commit', data);
     repo.refs.set(ref, oid);
+    touchRefs(repo);
     repo.updatedAt = this.nowIso();
     return oid;
   }
@@ -272,7 +295,10 @@ export class Forge {
     const ref = `refs/heads/${branch}`;
     if (!repo.refs.has(ref)) {
       const base = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-      if (base !== undefined) repo.refs.set(ref, base);
+      if (base !== undefined) {
+        repo.refs.set(ref, base);
+        touchRefs(repo);
+      }
     }
     const tip = repo.refs.get(ref);
     const files = tip !== undefined ? this.filesAtCommit(repo, tip) : new Map<string, { oid: string; mode: string }>();
@@ -549,6 +575,7 @@ export class Forge {
     const data = buildCommit({ tree, parents, author: identity, committer: identity, message });
     const oid = putObject(repo.objects, 'commit', data);
     repo.refs.set(`refs/heads/${pull.baseRef}`, oid);
+    touchRefs(repo);
     pull.merged = true;
     pull.state = 'closed';
     pull.mergedAt = this.nowIso();

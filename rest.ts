@@ -6,13 +6,16 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseCommit } from './git.ts';
-import { ForgeError, VIEWER, type Forge, type IssueRec, type PullRec, type RepoRec } from './forge.ts';
-import { authorized, parseJsonBody, pathSegments, readBody, sendEmpty, sendError, sendJson } from './http.ts';
+import { ForgeError, touchRefs, VIEWER, type Forge, type IssueRec, type PullRec, type RepoRec } from './forge.ts';
+import { authorized, parseJsonBody, pathSegments, readBody, sendEmpty, sendError, sendJson, sendText } from './http.ts';
 
 // ------------------------------------------------------------------ serializers
 
+/** The viewer's JSON shape, built once: it never varies, and serializers only read it. */
+const USER_JSON: Record<string, unknown> = { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email, type: 'User' };
+
 export function userJson(): Record<string, unknown> {
-  return { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email, type: 'User' };
+  return USER_JSON;
 }
 
 export function repoJson(repo: RepoRec): Record<string, unknown> {
@@ -48,6 +51,23 @@ export function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknow
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
   };
+}
+
+/**
+ * An issue's serialized REST body, cached on the issue itself. The stamp is the issue's
+ * updatedAt plus its comment count: every mutation path (REST patch, a new comment, the
+ * GraphQL close) moves updatedAt through the forge's strictly increasing clock, and a
+ * label's colour cannot change once the label exists, so a matching stamp means the
+ * cached text is exactly what issueJson would build now. The read workload asks for one
+ * issue thousands of times; this turns those answers into a memory copy.
+ */
+export function issueJsonText(repo: RepoRec, issue: IssueRec): string {
+  const stamp = `${issue.updatedAt}|${issue.comments.length}`;
+  const cached = issue.jsonCache;
+  if (cached !== undefined && cached.stamp === stamp) return cached.text;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issue.jsonCache = { stamp, text };
+  return text;
 }
 
 export function commentJson(comment: { id: number; body: string; createdAt: string }): Record<string, unknown> {
@@ -239,6 +259,7 @@ async function routeRepo(ctx: Ctx, repo: RepoRec, rest: string[]): Promise<void>
       if (!ref.startsWith('refs/') || !repo.objects.has(sha)) throw new ForgeError(422, 'Validation Failed: invalid ref or sha');
       if (repo.refs.has(ref)) throw new ForgeError(422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      touchRefs(repo);
       sendJson(res, 201, { ref, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } });
       return;
     }
@@ -322,7 +343,7 @@ async function routeRepo(ctx: Ctx, repo: RepoRec, rest: string[]): Promise<void>
       const rawLabels = Array.isArray(body.labels) ? body.labels : [];
       const labels = rawLabels.map((entry) => (typeof entry === 'string' ? entry : String((entry as { name?: unknown }).name ?? '')));
       const issue = forge.createIssue(repo, { title, body: str(body, 'body') ?? '', labels });
-      sendJson(res, 201, issueJson(repo, issue));
+      sendText(res, 201, issueJsonText(repo, issue));
       return;
     }
     if (rest.length === 1 && req.method === 'GET') {
@@ -334,7 +355,7 @@ async function routeRepo(ctx: Ctx, repo: RepoRec, rest: string[]): Promise<void>
     }
     const number = Number.parseInt(rest[1] ?? '', 10);
     if (rest.length === 2 && req.method === 'GET') {
-      sendJson(res, 200, issueJson(repo, forge.getIssue(repo, number)));
+      sendText(res, 200, issueJsonText(repo, forge.getIssue(repo, number)));
       return;
     }
     if (rest.length === 2 && req.method === 'PATCH') {
@@ -352,7 +373,7 @@ async function routeRepo(ctx: Ctx, repo: RepoRec, rest: string[]): Promise<void>
         issue.labels = labels;
       }
       issue.updatedAt = forge.nowIso();
-      sendJson(res, 200, issueJson(repo, issue));
+      sendText(res, 200, issueJsonText(repo, issue));
       return;
     }
     if (rest.length === 3 && rest[2] === 'comments' && req.method === 'POST') {
