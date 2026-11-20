@@ -49,8 +49,8 @@ const EMPTY_BODY = Buffer.alloc(0);
 
 /** Read a whole request body (bodies in this contest are small; the cap is generous). */
 export function readBody(req: IncomingMessage): Promise<Buffer> {
-  // The raw-socket server (server.ts) parses each request whole before dispatch, so the
-  // body is already here; the stream path below serves any other transport.
+  // A transport that parses each request whole before dispatch may hand the body over
+  // directly; otherwise it is read from the stream.
   const preloaded = (req as unknown as { bodyBuffer?: Buffer }).bodyBuffer;
   if (preloaded !== undefined) return Promise.resolve(preloaded);
   return new Promise((resolve, reject) => {

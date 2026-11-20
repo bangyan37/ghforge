@@ -3,21 +3,18 @@
 // endpoint at /mcp. Anything else is a JSON 404 with {message: "Not Found"} — never HTML.
 // main.ts owns the entry <-> env lifecycle; this file is only the server.
 //
-// The wire layer is server.ts, a minimal HTTP/1.1 server on raw sockets: the suite makes
-// thousands of small requests, and node:http's per-request machinery costs more than the
-// handlers' own work at that scale. Dispatch goes by the path first, because the four
-// surfaces own disjoint paths: a request is routed to the one surface that can answer it
-// instead of being offered to each in turn — the routing outcome for every path is the
-// same as offering it to all four in order.
+// Dispatch goes by the path first, because the four surfaces own disjoint paths: a request
+// is routed to the one surface that can answer it instead of being offered to each in
+// turn — the routing outcome for every path is the same as offering it to all four in
+// order.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge, ForgeError } from './forge.ts';
 import { handleGitHttp } from './gitHttp.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { handleRest } from './rest.ts';
 import { sendError, sendJson } from './http.ts';
-import { RawServer, type RawRequest, type RawResponse } from './server.ts';
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 function urlOf(url: string): URL {
@@ -28,12 +25,10 @@ function urlOf(url: string): URL {
   }
 }
 
-export function createApp(): RawServer {
+export function createApp(): Server {
   const forge = new Forge();
-  const dispatch = async (rawReq: RawRequest, rawRes: RawResponse): Promise<void> => {
-    const req = rawReq as unknown as IncomingMessage;
-    const res = rawRes as unknown as ServerResponse;
-    const url = urlOf(rawReq.url);
+  const dispatch = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const url = urlOf(req.url ?? '/');
     const path = url.pathname;
     try {
       if (path === '/healthz') {
@@ -66,5 +61,7 @@ export function createApp(): RawServer {
       sendError(res, 500, err instanceof Error ? err.message : 'Internal error');
     }
   };
-  return new RawServer(dispatch);
+  return createServer((req, res) => {
+    void dispatch(req, res);
+  });
 }
